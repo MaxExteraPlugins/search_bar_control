@@ -28,7 +28,7 @@ Pin the search bar on the dialogs list and auto-collapse stories section.
 ## 📥 Installation
 
 1. Navigate to the [**Releases**](https://github.com/MaxExteraPlugins/search_bar_control/releases/latest) section.
-2. Download the `search_bar_control_v4.0.0.plugin` file.
+2. Download the `search_bar_control_v4.0.1.plugin` file.
 3. Send the file to your Telegram Saved Messages or open it via file manager in exteraGram / AyuGram.
 4. Tap the file in Telegram and choose **"Install plugin"**.
 
