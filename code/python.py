@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 from typing import Any, List
 from java.lang import Float as JFloat, Boolean as JBoolean, Integer as JInteger
-from java import jfloat
+from java import jfloat, dynamic_proxy
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class
-from ui.settings import Switch, Header, Selector, Input, Text, Divider
+from ui.settings import Switch, Header, Selector, Input, Text, Divider, Custom, SimpleSettingFactory
+from ui.bulletin import BulletinHelper
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread
 import time
 
 __id__ = "search_bar_control"
 __name__ = "Search Bar Control"
 __description__ = "Pins the search bar on the main page and helps collapse stories."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "4.0.3"
+__version__ = "4.0.5"
 __icon__ = "MaxExteraPluginsStickers/3"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.5.1"
@@ -19,6 +22,34 @@ __sdk_version__ = ">=1.4.3.3"
 min_version = "12.5.1"
 app_version = ">=12.5.1"
 sdk_version = ">=1.4.3.3"
+
+
+def is_ru_locale() -> bool:
+    try:
+        from org.telegram.messenger import LocaleController
+        lang = str(LocaleController.getInstance().getCurrentLocale().getLanguage() or "").lower()
+        if lang:
+            return lang in ("ru", "be", "uk", "kk")
+    except Exception:
+        pass
+    try:
+        from java.util import Locale
+        lang = str(Locale.getDefault().getLanguage() or "").lower()
+        return lang in ("ru", "be", "uk", "kk")
+    except Exception:
+        pass
+    return False
+
+
+def format_argb_hex(color_int: int) -> str:
+    c = int(color_int) & 0xFFFFFFFF
+    a = (c >> 24) & 0xFF
+    r = (c >> 16) & 0xFF
+    g = (c >> 8) & 0xFF
+    b = c & 0xFF
+    if a == 0xFF:
+        return f"#{r:02X}{g:02X}{b:02X}"
+    return f"#{r:02X}{g:02X}{b:02X}{a:02X}"
 
 
 def to_signed32(v):
@@ -67,6 +98,8 @@ class ScrollYHook(MethodHook):
         self._expand_time = 0
         self._style_applied = False
         self._search_dp = None
+        self._scroll_vertically_depth = 0
+        self._hooked_lm_classes = set()
 
     def _resolve_field(self, instance, name):
         cls_obj = instance.getClass()
@@ -141,7 +174,21 @@ class ScrollYHook(MethodHook):
                 self._search_dp = 0
         return self._search_dp
 
+    def _has_any_stories(self, instance):
+        if self._get_field(instance, "hasStories") == True:
+            return True
+        if self._get_field(instance, "animateToHasStories") == True:
+            return True
+        if self._get_field(instance, "dialogStoriesCellVisible") == True:
+            return True
+        if not (self._get_field(instance, "hasOnlySlefStories") == False and self._get_field(instance, "hasOnlySelfStories") == False):
+            if self._get_field(instance, "hasOnlySlefStories") == True or self._get_field(instance, "hasOnlySelfStories") == True:
+                return True
+        return False
+
     def _force_collapsed_stories(self, instance):
+        if not self._has_any_stories(instance):
+            return
         was_true = (self._get_field(instance, "hasStories") == True)
         self._set_field(instance, "hasStories", False)
         self._set_field(instance, "animateToHasStories", False)
@@ -155,6 +202,7 @@ class ScrollYHook(MethodHook):
             except Exception:
                 pass
         if was_true:
+            self._set_field(instance, "scrollYOffset", jfloat(0.0))
             fv = self._get_field(instance, "fragmentView")
             if fv is not None:
                 try:
@@ -205,27 +253,34 @@ class ScrollYHook(MethodHook):
             text_color = parse_color(text_hex)
             icon_color = parse_color(icon_hex)
 
-            radius = 0.0
-            if radius_str:
+            radius = -1.0
+            if radius_str and str(radius_str).strip():
                 try:
-                    radius = float(radius_str.strip())
+                    radius = float(str(radius_str).strip())
                 except Exception:
-                    radius = 0.0
-
-            if bg_color is None and text_color is None and icon_color is None and radius <= 0:
-                return
+                    radius = -1.0
 
             from org.telegram.messenger import AndroidUtilities
+            from org.telegram.ui.ActionBar import Theme
 
-            if bg_color is not None or radius > 0:
+            if bg_color is not None or radius >= 0:
                 try:
                     from android.graphics.drawable import GradientDrawable
                     drawable = GradientDrawable()
                     if bg_color is not None:
                         drawable.setColor(bg_color)
-                    if radius > 0:
-                        drawable.setCornerRadius(float(AndroidUtilities.dp(jfloat(float(radius)))))
+                    else:
+                        drawable.setColor(Theme.multAlpha(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText), 0.08))
+                    r_dp = radius if radius >= 0 else 24.0
+                    drawable.setCornerRadius(float(AndroidUtilities.dp(jfloat(float(r_dp)))))
                     search_field.setBackground(drawable)
+                except Exception:
+                    pass
+            else:
+                try:
+                    search_field.setBackground(None)
+                    if hasattr(search_field, "updateColors"):
+                        search_field.updateColors()
                 except Exception:
                     pass
 
@@ -235,29 +290,47 @@ class ScrollYHook(MethodHook):
             except Exception:
                 pass
 
-            if edit_text is not None and text_color is not None:
+            if edit_text is not None:
                 try:
-                    edit_text.setHintTextColor(text_color)
+                    if text_color is not None:
+                        edit_text.setHintTextColor(text_color)
+                    else:
+                        edit_text.setHintTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteGrayText))
                 except Exception:
                     pass
 
             effective_icon = icon_color if icon_color is not None else text_color
-            if effective_icon is not None:
-                try:
-                    from android.graphics import PorterDuff, PorterDuffColorFilter
-                    si = self._get_field(search_field, "searchIcon")
-                    if si is not None:
-                        si.setColorFilter(PorterDuffColorFilter(effective_icon, PorterDuff.Mode.SRC_IN))
-                except Exception:
-                    pass
-                try:
-                    from android.graphics import PorterDuff, PorterDuffColorFilter
-                    ci = self._get_field(search_field, "closeIcon")
-                    if ci is not None:
-                        ci.setColorFilter(PorterDuffColorFilter(effective_icon, PorterDuff.Mode.SRC_IN))
-                except Exception:
-                    pass
+            try:
+                from android.graphics import PorterDuff, PorterDuffColorFilter
+                cf = PorterDuffColorFilter(effective_icon, PorterDuff.Mode.SRC_IN) if effective_icon is not None else None
+                si = self._get_field(search_field, "searchIcon")
+                if si is not None:
+                    si.setColorFilter(cf)
+                ci = self._get_field(search_field, "closeIcon")
+                if ci is not None:
+                    ci.setColorFilter(cf)
+            except Exception:
+                pass
 
+        except Exception:
+            pass
+
+    def _ensure_lm_hooked(self, instance):
+        try:
+            view_pages = self._get_field(instance, "viewPages")
+            if view_pages is None:
+                return
+            for page in view_pages:
+                if page is None:
+                    continue
+                lm = self._get_field(page, "layoutManager")
+                if lm is None:
+                    continue
+                cls_obj = lm.getClass()
+                cls_name = str(cls_obj.getName())
+                if cls_name not in self._hooked_lm_classes:
+                    self._hooked_lm_classes.add(cls_name)
+                    self.plugin.hook_all_methods(cls_obj, "scrollVerticallyBy", ScrollVerticallyByHook(self))
         except Exception:
             pass
 
@@ -269,6 +342,7 @@ class ScrollYHook(MethodHook):
 
             fval = float(value)
             self._last_instance = param.thisObject
+            self._ensure_lm_hooked(param.thisObject)
 
             should_pin = self._should_pin(param.thisObject)
             collapse = self.plugin.get_setting("collapse_stories", False)
@@ -283,11 +357,6 @@ class ScrollYHook(MethodHook):
                     if dp81 > 0 and fval <= -dp81 and elapsed > 0.6:
                         self._expanded_by_user = False
                         self._force_collapsed_stories(param.thisObject)
-                        self._set_field(
-                            param.thisObject,
-                            "scrollAdditionalOffset",
-                            float(-dp81),
-                        )
                         new_val = fval + dp81
                         if should_pin and new_val < 0:
                             new_val = 0.0
@@ -295,8 +364,13 @@ class ScrollYHook(MethodHook):
                     return
                 self._force_collapsed_stories(param.thisObject)
 
-            if should_pin and fval < 0:
-                param.args[0] = JFloat(0.0)
+            if should_pin:
+                has_stories = (self._get_field(param.thisObject, "hasStories") == True)
+                if collapse and not is_archive and not self._expanded_by_user:
+                    has_stories = False
+                min_scroll_y = -self._get_dp81() if has_stories else 0.0
+                if fval < min_scroll_y:
+                    param.args[0] = JFloat(float(min_scroll_y))
         except Exception:
             pass
 
@@ -318,82 +392,50 @@ class GetMaxScrollYOffsetHook(MethodHook):
         try:
             if not self.syh._should_pin(param.thisObject):
                 return
-            search_h = self.syh._get_search_dp()
-            if search_h <= 0:
-                return
-            result = param.getResult()
-            if result is None:
-                return
-            current = int(result)
-            new_val = current - search_h
-            if new_val < 0:
-                new_val = 0
-            param.setResult(JInteger(new_val))
+            collapse = self.syh.plugin.get_setting("collapse_stories", False)
+            is_archive = (self.syh._get_folder_id(param.thisObject) == 1)
+            has_stories = (self.syh._get_field(param.thisObject, "hasStories") == True)
+            if collapse and not is_archive and not self.syh._expanded_by_user:
+                has_stories = False
+            max_scroll_y = int(self.syh._get_dp81()) if has_stories else 0
+            param.setResult(JInteger(max_scroll_y))
         except Exception:
             pass
 
 
-class CheckAutoscrollHook(MethodHook):
+class GetSearchFieldHeightHook(MethodHook):
 
     def __init__(self, scroll_y_hook):
         self.syh = scroll_y_hook
 
     def before_hooked_method(self, param):
+        if self.syh._scroll_vertically_depth > 0:
+            param.setResult(JInteger(0))
+
+
+class ScrollVerticallyByHook(MethodHook):
+
+    def __init__(self, scroll_y_hook):
+        self.syh = scroll_y_hook
+        self._stack = []
+
+    def before_hooked_method(self, param):
+        pushed = False
         try:
-            if not self.syh._should_pin(param.thisObject):
-                return
-            scroll_y_offset = self.syh._get_field(param.thisObject, "scrollYOffset")
-            if scroll_y_offset is None:
-                return
-            scroll_y = int(-float(scroll_y_offset))
-            if scroll_y == 0:
-                param.setResult(JBoolean(False))
-                return
-            has_stories = self.syh._get_field(param.thisObject, "hasStories")
-            collapse = self.syh.plugin.get_setting("collapse_stories", False)
-            folder_id = self.syh._get_folder_id(param.thisObject)
-            is_archive = (folder_id == 1)
-            if collapse and not is_archive:
-                has_stories = False
-            if not has_stories:
-                param.setResult(JBoolean(False))
-                return
-            from org.telegram.messenger import AndroidUtilities
-            stories_h = int(AndroidUtilities.dp(jfloat(81.0)))
-            if scroll_y == stories_h:
-                param.setResult(JBoolean(False))
-                return
-            view_pages = self.syh._get_field(param.thisObject, "viewPages")
-            if view_pages is None:
-                return
-            page = view_pages[0]
-            if page is None:
-                return
-            list_view = self.syh._get_field(page, "listView")
-            if list_view is None:
-                return
-            can_scroll_up = list_view.canScrollVertically(-1)
-            if not can_scroll_up and scroll_y > 0:
-                param.setResult(JBoolean(False))
-                return
-            scroller = self.syh._get_field(page, "scroller")
-            if scroller is None:
-                return
-            dialog_stories_cell = self.syh._get_field(param.thisObject, "dialogStoriesCell")
-            k_val = 0.5
-            if dialog_stories_cell is not None:
-                try:
-                    k_field = self.syh._resolve_field(dialog_stories_cell, "K")
-                    if k_field is not None:
-                        k_val = float(k_field.get(dialog_stories_cell))
-                except Exception:
-                    pass
-            progress = min(1.0, max(0.0, float(scroll_y) / float(stories_h))) if stories_h > 0 else 0.0
-            if progress < k_val:
-                scroller.smoothScrollBy(-scroll_y)
-            else:
-                scroller.smoothScrollBy(stories_h - scroll_y)
-            param.setResult(JBoolean(True))
+            if len(param.args) > 0 and int(param.args[0]) < 0:
+                inst = self.syh._last_instance
+                if inst is not None and self.syh._should_pin(inst):
+                    self.syh._scroll_vertically_depth += 1
+                    pushed = True
+        except Exception:
+            pass
+        self._stack.append(pushed)
+
+    def after_hooked_method(self, param):
+        try:
+            if self._stack and self._stack.pop():
+                if self.syh._scroll_vertically_depth > 0:
+                    self.syh._scroll_vertically_depth -= 1
         except Exception:
             pass
 
@@ -1030,7 +1072,7 @@ class SearchBarControlPlugin(BasePlugin):
             pass
 
         try:
-            self.hook_all_methods(cls, "checkAutoscrollToStories", CheckAutoscrollHook(scroll_hook))
+            self.hook_all_methods(cls, "getSearchFieldHeight", GetSearchFieldHeightHook(scroll_hook))
         except Exception:
             pass
 
@@ -1075,26 +1117,221 @@ class SearchBarControlPlugin(BasePlugin):
                 pass
         return handler
 
-    def _on_style_change(self, new_value):
+    def _on_style_change(self, new_value=None):
         try:
+            self._refresh_previews()
             hook = getattr(self, "_scroll_hook", None)
             if hook is not None and hook._last_instance is not None:
                 hook._style_applied = False
-                from org.telegram.messenger import AndroidUtilities
-                AndroidUtilities.runOnUIThread(lambda: hook.apply_style(hook._last_instance))
+                run_on_ui_thread(lambda: hook.apply_style(hook._last_instance))
         except Exception:
             pass
 
-    def _on_lang_change(self, new_value):
+    def _style_preview_bar(self, bar, search_icon, hint_view, close_icon):
         try:
-            if hasattr(self, "reload_settings"):
-                self.reload_settings()
-            elif hasattr(self, "update_settings"):
-                self.update_settings()
-            elif hasattr(self, "refresh_settings"):
-                self.refresh_settings()
+            from org.telegram.messenger import AndroidUtilities
+            from org.telegram.ui.ActionBar import Theme
+            from android.graphics.drawable import GradientDrawable
+            from android.graphics import PorterDuff, PorterDuffColorFilter
+
+            dp = AndroidUtilities.dp
+            bg_color = parse_color(self.get_setting("panel_bg_color", ""))
+            text_color = parse_color(self.get_setting("panel_text_color", ""))
+            icon_color = parse_color(self.get_setting("panel_icon_color", ""))
+            radius_str = self.get_setting("panel_radius", "")
+
+            radius = 24.0
+            if radius_str and str(radius_str).strip():
+                try:
+                    radius = max(0.0, float(str(radius_str).strip()))
+                except Exception:
+                    radius = 24.0
+
+            default_bg = Theme.multAlpha(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText), 0.08)
+            default_text = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText)
+
+            drawable = GradientDrawable()
+            drawable.setColor(bg_color if bg_color is not None else default_bg)
+            drawable.setCornerRadius(float(dp(jfloat(radius))))
+            bar.setBackground(drawable)
+
+            effective_text = text_color if text_color is not None else default_text
+            hint_view.setTextColor(effective_text)
+
+            effective_icon = icon_color if icon_color is not None else effective_text
+            cf = PorterDuffColorFilter(effective_icon, PorterDuff.Mode.SRC_IN)
+            search_icon.setColorFilter(cf)
+            close_icon.setColorFilter(cf)
         except Exception:
             pass
+
+    def _refresh_previews(self):
+        previews = getattr(self, "_preview_refs", None)
+        if not previews:
+            return
+        alive = []
+        for ref in previews:
+            parts = ref.get("bar_ref")
+            bar = parts() if parts is not None else None
+            if bar is not None:
+                self._style_preview_bar(bar, ref["search"], ref["hint"], ref["close"])
+                alive.append(ref)
+        self._preview_refs = alive
+
+    def _preview_item(self):
+        if getattr(self, "_preview_factory", None) is None:
+            plugin = self
+            if not hasattr(self, "_preview_refs"):
+                self._preview_refs = []
+
+            def create_view(context, list_view, account, guid, provider):
+                from android.view import ViewGroup, Gravity
+                from android.widget import FrameLayout, ImageView, TextView
+                from org.telegram.messenger import AndroidUtilities, R as TelegramR
+                from org.telegram.ui.ActionBar import Theme
+                from java.lang.ref import WeakReference
+
+                dp = AndroidUtilities.dp
+                host = FrameLayout(context)
+                host.setLayoutParams(ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(76)))
+                host.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray))
+
+                bar = FrameLayout(context)
+                bar_lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48), Gravity.CENTER)
+                bar_lp.leftMargin = dp(12)
+                bar_lp.rightMargin = dp(12)
+                host.addView(bar, bar_lp)
+
+                search_icon = ImageView(context)
+                search_icon.setScaleType(ImageView.ScaleType.CENTER)
+                search_icon.setImageResource(TelegramR.drawable.outline_search_1_24)
+                si_lp = FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER_VERTICAL | Gravity.LEFT)
+                si_lp.leftMargin = dp(12)
+                bar.addView(search_icon, si_lp)
+
+                hint_view = TextView(context)
+                hint_view.setText("Поиск чатов" if is_ru_locale() else "Search chats")
+                hint_view.setTextSize(15.0)
+                hint_view.setSingleLine(True)
+                hint_lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_VERTICAL | Gravity.LEFT)
+                hint_lp.leftMargin = dp(48)
+                hint_lp.rightMargin = dp(48)
+                bar.addView(hint_view, hint_lp)
+
+                close_icon = ImageView(context)
+                close_icon.setScaleType(ImageView.ScaleType.CENTER)
+                close_icon.setImageResource(TelegramR.drawable.miniplayer_close)
+                close_icon.setAlpha(0.55)
+                ci_lp = FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER_VERTICAL | Gravity.RIGHT)
+                ci_lp.rightMargin = dp(12)
+                bar.addView(close_icon, ci_lp)
+
+                plugin._style_preview_bar(bar, search_icon, hint_view, close_icon)
+                ref = {
+                    "bar_ref": WeakReference(bar).get,
+                    "search": search_icon,
+                    "hint": hint_view,
+                    "close": close_icon,
+                }
+                host.setTag(ref)
+                plugin._preview_refs.append(ref)
+                return host
+
+            def bind_view(view, item, divider, adapter, list_view):
+                if view is None:
+                    return
+                ref = view.getTag()
+                if isinstance(ref, dict):
+                    bar = ref["bar_ref"]()
+                    if bar is not None:
+                        ref["hint"].setText("Поиск чатов" if is_ru_locale() else "Search chats")
+                        plugin._style_preview_bar(bar, ref["search"], ref["hint"], ref["close"])
+
+            self._preview_factory = SimpleSettingFactory(
+                create_view,
+                bind_view,
+                is_clickable=False,
+                is_shadow=False,
+            )
+        return Custom(factory=self._preview_factory.instance.java)
+
+    def _pick_color(self, key, default_color):
+        def handler(view=None):
+            run_on_ui_thread(lambda: self._show_color_picker(key, default_color))
+        return handler
+
+    def _show_color_picker(self, key, default_color):
+        picker = getattr(self, "_picker", None)
+        if picker is not None:
+            try:
+                if bool(picker.isShowing()):
+                    return
+            except Exception:
+                pass
+            self._picker = None
+            self._picker_refs = None
+        try:
+            from android.view import View
+            from org.telegram.ui.Components.Paint import ColorPickerBottomSheet
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None:
+                return
+            current_hex = self.get_setting(key, "")
+            parsed = parse_color(current_hex)
+            initial_int = parsed if parsed is not None else default_color
+
+            sheet = ColorPickerBottomSheet(activity, fragment.getResourceProvider())
+            pipette = _NoPipette()
+            sink = _ColorSink(self, key, format_argb_hex(initial_int))
+            refs = [pipette, sink]
+            try:
+                done_field = sheet.getClass().getDeclaredField("doneView")
+                done_field.setAccessible(True)
+                done_view = done_field.get(sheet)
+                if done_view is not None:
+                    done_click = _DoneClick(sink, sheet)
+                    done_view.setOnClickListener(done_click)
+                    refs.append(done_click)
+            except Exception:
+                pass
+            sheet.setPipetteDelegate(pipette)
+            sheet.setColor(int(initial_int))
+            sheet.setColorListener(sink)
+            self._picker = sheet
+            self._picker_refs = tuple(refs)
+            if fragment.showDialog(sheet) is None:
+                self._dismiss_picker()
+        except Exception:
+            self._dismiss_picker()
+            BulletinHelper.show_error("Не удалось открыть палитру" if is_ru_locale() else "Failed to open color picker")
+
+    def _save_picked_color(self, key, hex_color):
+        self._picker = None
+        self._picker_refs = None
+        self.set_setting(key, hex_color, reload_settings=True)
+        self._on_style_change(hex_color)
+
+    def _clear_picker(self):
+        self._picker = None
+        self._picker_refs = None
+
+    def _dismiss_picker(self):
+        sheet = getattr(self, "_picker", None)
+        self._picker = None
+        self._picker_refs = None
+        if sheet is not None:
+            try:
+                sheet.setColorListener(None)
+                sheet.dismiss()
+            except Exception:
+                pass
+
+    def _reset_panel_style(self, view=None):
+        for k in ("panel_bg_color", "panel_text_color", "panel_icon_color", "panel_radius"):
+            self.set_setting(k, "", reload_settings=(k == "panel_radius"))
+        self._on_style_change(None)
+        BulletinHelper.show_info("Стиль панели сброшен" if is_ru_locale() else "Panel style reset")
 
     def create_settings(self):
         try:
@@ -1106,18 +1343,17 @@ class SearchBarControlPlugin(BasePlugin):
         return items
 
     def _inner_create_settings(self):
-        lang = self.get_setting("lang", 0)
-        is_ru = (lang == 1)
+        is_ru = is_ru_locale()
+        from org.telegram.ui.ActionBar import Theme
+        default_bg = Theme.multAlpha(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText), 0.08)
+        default_text = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText)
+
+        bg_val = str(self.get_setting("panel_bg_color", "") or "").strip()
+        text_val = str(self.get_setting("panel_text_color", "") or "").strip()
+        icon_val = str(self.get_setting("panel_icon_color", "") or "").strip()
+        default_label = "По умолчанию" if is_ru else "Default"
+
         return [
-            Header(text="Localization" if not is_ru else "Локализация"),
-            Selector(
-                key="lang",
-                text="Language" if not is_ru else "Язык",
-                default=0,
-                items=["English", "Русский"],
-                on_change=self._on_lang_change,
-            ),
-            Divider(),
             Header(text="Information" if not is_ru else "Информация"),
             Text(
                 text="Documentation" if not is_ru else "Документация",
@@ -1166,37 +1402,105 @@ class SearchBarControlPlugin(BasePlugin):
             ),
             Divider(),
             Header(text="Panel Customization" if not is_ru else "Кастомизация панели"),
-            Input(
-                key="panel_bg_color",
+            self._preview_item(),
+            Text(
                 text="Background Color" if not is_ru else "Цвет фона",
-                default="",
-                subtext="#RRGGBB or #RRGGBBAA" if not is_ru else "#RRGGBB или #RRGGBBAA",
-                on_change=self._on_style_change,
+                icon="msg_colors",
+                subtext=bg_val if bg_val else default_label,
+                on_click=self._pick_color("panel_bg_color", default_bg),
             ),
-            Input(
-                key="panel_text_color",
+            Text(
                 text="Hint Text Color" if not is_ru else "Цвет подсказки",
-                default="",
-                subtext="#RRGGBB or #RRGGBBAA — label «Search chats»" if not is_ru else "#RRGGBB или #RRGGBBAA — надпись «Поиск чатов»",
-                on_change=self._on_style_change,
+                icon="msg_palette",
+                subtext=text_val if text_val else default_label,
+                on_click=self._pick_color("panel_text_color", default_text),
             ),
-            Input(
-                key="panel_icon_color",
+            Text(
                 text="Icon Color" if not is_ru else "Цвет иконок",
-                default="",
-                subtext="#RRGGBB or #RRGGBBAA (empty = text color)" if not is_ru else "#RRGGBB или #RRGGBBAA (если пусто = цвет текста)",
-                on_change=self._on_style_change,
+                icon="msg_theme",
+                subtext=icon_val if icon_val else (text_val if text_val else default_label),
+                on_click=self._pick_color("panel_icon_color", default_text),
             ),
             Input(
                 key="panel_radius",
                 text="Corner Radius (dp)" if not is_ru else "Закругление углов (dp)",
                 default="",
-                subtext="Number, e.g.: 18" if not is_ru else "Число, например: 18",
+                subtext="Number, e.g.: 18 (empty = default)" if not is_ru else "Число, например: 18 (пусто = по умолчанию)",
                 on_change=self._on_style_change,
+            ),
+            Text(
+                text="Reset Panel Style" if not is_ru else "Сбросить стиль панели",
+                icon="msg_reset",
+                red=True,
+                on_click=self._reset_panel_style,
             ),
         ]
 
     def on_plugin_unload(self):
+        self._dismiss_picker()
         if hasattr(self, "_author_helper"):
             self._author_helper.on_unload()
+
+
+from android.view import View as _AndroidView
+from androidx.core.util import Consumer as _AndroidConsumer
+from org.telegram.ui.Components.Paint import ColorPickerBottomSheet as _CPBS
+
+
+class _DoneClick(dynamic_proxy(_AndroidView.OnClickListener)):
+    def __init__(self, sink, sheet):
+        super().__init__()
+        self.sink = sink
+        self.sheet = sheet
+
+    def onClick(self, view):
+        self.sink.confirmed = True
+        self.sheet.dismiss()
+
+
+class _ColorSink(dynamic_proxy(_AndroidConsumer)):
+    def __init__(self, plugin, key, initial):
+        super().__init__()
+        self.plugin = plugin
+        self.key = key
+        self.initial = initial
+        self.confirmed = False
+
+    def accept(self, color):
+        plugin = self.plugin
+        self.plugin = None
+        if plugin is not None:
+            try:
+                picked = format_argb_hex(int(color))
+                if self.confirmed or picked != self.initial:
+                    plugin._save_picked_color(self.key, picked)
+                else:
+                    plugin._clear_picker()
+            except Exception:
+                pass
+
+
+class _NoPipette(dynamic_proxy(_CPBS.PipetteDelegate)):
+    def onStartColorPipette(self):
+        pass
+
+    def onStopColorPipette(self):
+        pass
+
+    def getContainerView(self):
+        return None
+
+    def getSnapshotDrawingView(self):
+        return None
+
+    def onDrawImageOverCanvas(self, bitmap, canvas):
+        pass
+
+    def isPipetteVisible(self):
+        return False
+
+    def isPipetteAvailable(self):
+        return False
+
+    def onColorSelected(self, color):
         pass
