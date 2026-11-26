@@ -14,7 +14,7 @@ __id__ = "search_bar_control"
 __name__ = "Search Bar Control"
 __description__ = "Pins the search bar on the main page and helps collapse stories."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "4.0.5"
+__version__ = "4.0.14"
 __icon__ = "MaxExteraPluginsStickers/3"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.5.1"
@@ -97,6 +97,7 @@ class ScrollYHook(MethodHook):
         self._dp81 = None
         self._expand_time = 0
         self._style_applied = False
+        self._custom_style_used = False
         self._search_dp = None
         self._scroll_vertically_depth = 0
         self._hooked_lm_classes = set()
@@ -203,6 +204,7 @@ class ScrollYHook(MethodHook):
                 pass
         if was_true:
             self._set_field(instance, "scrollYOffset", jfloat(0.0))
+            self._set_field(instance, "scrollAdditionalOffset", jfloat(0.0))
             fv = self._get_field(instance, "fragmentView")
             if fv is not None:
                 try:
@@ -260,10 +262,15 @@ class ScrollYHook(MethodHook):
                 except Exception:
                     radius = -1.0
 
+            if bg_color is None and text_color is None and icon_color is None and radius < 0:
+                if not self._custom_style_used:
+                    return
+
             from org.telegram.messenger import AndroidUtilities
             from org.telegram.ui.ActionBar import Theme
 
             if bg_color is not None or radius >= 0:
+                self._custom_style_used = True
                 try:
                     from android.graphics.drawable import GradientDrawable
                     drawable = GradientDrawable()
@@ -276,7 +283,7 @@ class ScrollYHook(MethodHook):
                     search_field.setBackground(drawable)
                 except Exception:
                     pass
-            else:
+            elif self._custom_style_used:
                 try:
                     search_field.setBackground(None)
                     if hasattr(search_field, "updateColors"):
@@ -315,6 +322,53 @@ class ScrollYHook(MethodHook):
         except Exception:
             pass
 
+    def _ensure_search_visible(self, inst):
+        try:
+            if not self._should_pin(inst):
+                return
+            search_field = self._get_field(inst, "fragmentSearchField")
+            if search_field is None:
+                return
+            try:
+                if not inst.isSupportSearch():
+                    return
+            except Exception:
+                pass
+            try:
+                from com.exteragram.messenger import ExteraConfig
+                if ExteraConfig.getHideDialogsSearchBar():
+                    return
+            except Exception:
+                pass
+            action_bar = self._get_field(inst, "actionBar")
+            if action_bar is not None:
+                try:
+                    if action_bar.isActionModeShowed():
+                        return
+                except Exception:
+                    pass
+            p_am = self._get_field(inst, "progressToActionMode")
+            if p_am is not None and float(p_am) > 0.01:
+                return
+            if self._get_field(inst, "searchIsShowed") == True:
+                return
+            s_prog = self._get_field(inst, "searchAnimationProgress")
+            if s_prog is not None and float(s_prog) > 0.01:
+                return
+            right_container = self._get_field(inst, "rightSlidingDialogContainer")
+            if right_container is not None:
+                try:
+                    if right_container.hasFragment():
+                        return
+                except Exception:
+                    pass
+            if search_field.getVisibility() != 0:
+                search_field.setVisibility(0)
+            if float(search_field.getAlpha()) < 1.0:
+                search_field.setAlpha(jfloat(1.0))
+        except Exception:
+            pass
+
     def _ensure_lm_hooked(self, instance):
         try:
             view_pages = self._get_field(instance, "viewPages")
@@ -331,6 +385,7 @@ class ScrollYHook(MethodHook):
                 if cls_name not in self._hooked_lm_classes:
                     self._hooked_lm_classes.add(cls_name)
                     self.plugin.hook_all_methods(cls_obj, "scrollVerticallyBy", ScrollVerticallyByHook(self))
+                    self.plugin.hook_all_methods(cls_obj, "scrollToPositionWithOffset", ScrollToPositionWithOffsetHook(self))
         except Exception:
             pass
 
@@ -390,6 +445,7 @@ class GetMaxScrollYOffsetHook(MethodHook):
 
     def after_hooked_method(self, param):
         try:
+            self.syh._last_instance = param.thisObject
             if not self.syh._should_pin(param.thisObject):
                 return
             collapse = self.syh.plugin.get_setting("collapse_stories", False)
@@ -436,6 +492,253 @@ class ScrollVerticallyByHook(MethodHook):
             if self._stack and self._stack.pop():
                 if self.syh._scroll_vertically_depth > 0:
                     self.syh._scroll_vertically_depth -= 1
+        except Exception:
+            pass
+
+
+class ScrollToPositionWithOffsetHook(MethodHook):
+
+    def __init__(self, scroll_y_hook):
+        self.syh = scroll_y_hook
+
+    def before_hooked_method(self, param):
+        try:
+            if len(param.args) < 2:
+                return
+            inst = self.syh._last_instance
+            if inst is None or not self.syh._should_pin(inst):
+                return
+            if self.syh._get_field(param.thisObject, "fixOffset") == True:
+                return
+
+            pos = int(param.args[0])
+            offset = int(param.args[1])
+
+            view_pages = self.syh._get_field(inst, "viewPages")
+            if view_pages is None or len(view_pages) == 0 or view_pages[0] is None:
+                return
+            vp = view_pages[0]
+            lm = self.syh._get_field(vp, "layoutManager")
+            if lm is None or not lm.equals(param.thisObject):
+                return
+            list_view = self.syh._get_field(vp, "listView")
+            if list_view is None:
+                return
+
+            first_pos = 0
+            try:
+                dialogs_type = self.syh._get_field(vp, "dialogsType")
+                archive_state = self.syh._get_field(vp, "archivePullViewState")
+                if dialogs_type == 0 and archive_state == 2 and inst.hasHiddenArchive():
+                    first_pos = 1
+            except Exception:
+                pass
+
+            if pos != first_pos:
+                return
+
+            collapse = self.syh.plugin.get_setting("collapse_stories", False)
+            is_archive = (self.syh._get_folder_id(inst) == 1)
+            has_stories = (self.syh._get_field(inst, "hasStories") == True)
+            if collapse and not is_archive and not self.syh._expanded_by_user:
+                has_stories = False
+
+            stories_h = int(self.syh._get_dp81()) if has_stories else 0
+            min_offset = -stories_h
+            if offset >= min_offset:
+                return
+
+            p_top = int(list_view.getPaddingTop())
+            target_top = p_top - stories_h
+            holder = list_view.findViewHolderForAdapterPosition(first_pos)
+            if holder is None or int(holder.itemView.getTop()) >= target_top - 4:
+                param.args[1] = JInteger(min_offset)
+        except Exception:
+            pass
+
+
+class CheckSearchVisibilityHook(MethodHook):
+
+    def __init__(self, scroll_y_hook):
+        self.syh = scroll_y_hook
+
+    def after_hooked_method(self, param):
+        self.syh._ensure_search_visible(param.thisObject)
+
+
+class OnTransitionEndHook(MethodHook):
+
+    def __init__(self, scroll_y_hook):
+        self.syh = scroll_y_hook
+
+    def after_hooked_method(self, param):
+        inst = param.thisObject
+        self.syh._last_instance = inst
+        self.syh._ensure_search_visible(inst)
+
+
+class OnResumeHook(MethodHook):
+
+    def __init__(self, scroll_y_hook):
+        self.syh = scroll_y_hook
+        self._was_at_top = False
+
+    def _get_top_info(self, inst):
+        view_pages = self.syh._get_field(inst, "viewPages")
+        if view_pages is None or len(view_pages) == 0 or view_pages[0] is None:
+            return None
+        vp = view_pages[0]
+        list_view = self.syh._get_field(vp, "listView")
+        lm = self.syh._get_field(vp, "layoutManager")
+        if list_view is None or lm is None:
+            return None
+
+        first_pos = 0
+        try:
+            dialogs_type = self.syh._get_field(vp, "dialogsType")
+            archive_state = self.syh._get_field(vp, "archivePullViewState")
+            if dialogs_type == 0 and archive_state == 2 and inst.hasHiddenArchive():
+                first_pos = 1
+        except Exception:
+            pass
+
+        collapse = self.syh.plugin.get_setting("collapse_stories", False)
+        is_archive = (self.syh._get_folder_id(inst) == 1)
+        has_stories = (self.syh._get_field(inst, "hasStories") == True)
+        if collapse and not is_archive and not self.syh._expanded_by_user:
+            has_stories = False
+
+        stories_h = int(self.syh._get_dp81()) if has_stories else 0
+        target_offset = -stories_h
+        p_top = int(list_view.getPaddingTop())
+        target_top = p_top - stories_h
+        return vp, list_view, lm, first_pos, target_offset, target_top
+
+    def before_hooked_method(self, param):
+        self._was_at_top = False
+        try:
+            inst = param.thisObject
+            self.syh._last_instance = inst
+            self.syh._ensure_lm_hooked(inst)
+            if not self.syh._should_pin(inst):
+                return
+            collapse = self.syh.plugin.get_setting("collapse_stories", False)
+            is_archive = (self.syh._get_folder_id(inst) == 1)
+            if collapse and not is_archive and not self.syh._expanded_by_user:
+                self.syh._force_collapsed_stories(inst)
+                self.syh._set_field(inst, "scrollAdditionalOffset", jfloat(0.0))
+                sy = self.syh._get_field(inst, "scrollYOffset")
+                if sy is not None and float(sy) < 0.0:
+                    self.syh._set_field(inst, "scrollYOffset", jfloat(0.0))
+            else:
+                has_stories = (self.syh._get_field(inst, "hasStories") == True)
+                min_y = -self.syh._get_dp81() if has_stories else 0.0
+                sy = self.syh._get_field(inst, "scrollYOffset")
+                if sy is not None and float(sy) < min_y:
+                    self.syh._set_field(inst, "scrollYOffset", jfloat(float(min_y)))
+
+            info = self._get_top_info(inst)
+            if info is not None:
+                vp, list_view, lm, first_pos, target_offset, target_top = info
+                holder = list_view.findViewHolderForAdapterPosition(first_pos)
+                if holder is not None:
+                    top = int(holder.itemView.getTop())
+                    if top >= target_top - 4:
+                        self._was_at_top = True
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        try:
+            self.syh._ensure_search_visible(param.thisObject)
+        except Exception:
+            pass
+        if not self._was_at_top:
+            return
+        self._was_at_top = False
+        try:
+            inst = param.thisObject
+            info = self._get_top_info(inst)
+            if info is None:
+                return
+            vp, list_view, lm, first_pos, target_offset, target_top = info
+
+            def restore_top():
+                try:
+                    if not self.syh._should_pin(inst):
+                        return
+                    if list_view.getScrollState() != 0:
+                        return
+                    info2 = self._get_top_info(inst)
+                    if info2 is None:
+                        return
+                    _, lv2, lm2, fp2, toff2, ttop2 = info2
+                    holder = lv2.findViewHolderForAdapterPosition(fp2)
+                    if holder is not None and int(holder.itemView.getTop()) < ttop2:
+                        lm2.scrollToPositionWithOffset(fp2, toff2)
+                        inst.setScrollY(jfloat(float(toff2)))
+                except Exception:
+                    pass
+
+            run_on_ui_thread(restore_top)
+        except Exception:
+            pass
+
+
+class ShowSearchHook(MethodHook):
+
+    def __init__(self, scroll_y_hook, on_resume_hook):
+        self.syh = scroll_y_hook
+        self.orh = on_resume_hook
+        self._was_at_top = False
+
+    def before_hooked_method(self, param):
+        try:
+            inst = param.thisObject
+            self.syh._last_instance = inst
+            if not self.syh._should_pin(inst):
+                return
+            show = bool(param.args[0]) if len(param.args) > 0 else False
+            if show:
+                self._was_at_top = False
+                info = self.orh._get_top_info(inst)
+                if info is not None:
+                    _, list_view, _, first_pos, _, target_top = info
+                    holder = list_view.findViewHolderForAdapterPosition(first_pos)
+                    if holder is not None and int(holder.itemView.getTop()) >= target_top - 4:
+                        self._was_at_top = True
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param):
+        try:
+            inst = param.thisObject
+            if not self.syh._should_pin(inst):
+                return
+            show = bool(param.args[0]) if len(param.args) > 0 else False
+            if not show and self._was_at_top:
+                self._was_at_top = False
+
+                def restore_top():
+                    try:
+                        if not self.syh._should_pin(inst):
+                            return
+                        info = self.orh._get_top_info(inst)
+                        if info is None:
+                            return
+                        _, lv, lm, fp, toff, ttop = info
+                        if lv.getScrollState() != 0:
+                            return
+                        holder = lv.findViewHolderForAdapterPosition(fp)
+                        if holder is not None and int(holder.itemView.getTop()) < ttop:
+                            lm.scrollToPositionWithOffset(fp, toff)
+                            inst.setScrollY(jfloat(float(toff)))
+                        self.syh._ensure_search_visible(inst)
+                    except Exception:
+                        pass
+
+                run_on_ui_thread(restore_top)
+                run_on_ui_thread(restore_top, 220)
         except Exception:
             pass
 
@@ -1073,6 +1376,27 @@ class SearchBarControlPlugin(BasePlugin):
 
         try:
             self.hook_all_methods(cls, "getSearchFieldHeight", GetSearchFieldHeightHook(scroll_hook))
+        except Exception:
+            pass
+
+        try:
+            self.hook_all_methods(cls, "checkUi_searchFieldVisibility", CheckSearchVisibilityHook(scroll_hook))
+        except Exception:
+            pass
+
+        on_resume_hook = OnResumeHook(scroll_hook)
+        try:
+            self.hook_all_methods(cls, "onResume", on_resume_hook)
+        except Exception:
+            pass
+
+        try:
+            self.hook_all_methods(cls, "showSearch", ShowSearchHook(scroll_hook, on_resume_hook))
+        except Exception:
+            pass
+
+        try:
+            self.hook_all_methods(cls, "onTransitionAnimationEnd", OnTransitionEndHook(scroll_hook))
         except Exception:
             pass
 
